@@ -9,6 +9,5 @@ Comparing fungal community assembly and succession in the phyllosphere of wild a
   Vitis colonized by Spotted lanternfly, Lycorma delicatula, in southeastern Pennsylvania.
 
 Project authors: 
-
-Taleb, Mariam* 
+Taleb, Mariam*; 
 Urban, Julie
