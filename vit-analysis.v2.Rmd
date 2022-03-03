@@ -1,0 +1,490 @@
+---
+title: "Vit wk1-9"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Load packages and data
+
+## Install packages
+
+If you've already installed these packages, they don't need to be
+re-installed.
+
+When installing "phyloseq", if allowing updates to dependencies leads to
+non-zero exit status and installation failure, remove and reinstall
+igraph with first line of code, then re-run phyloseq install w/o updates
+to dependencies.
+
+```{r install-packages, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+install.packages("igraph", type = "binary") 
+install.packages("svglite")
+BiocManager::install("phyloseq", "microbiome", "ALDEx2", "DESeq2", "ANCOMBC")
+install.packages(c("vegan", "tidyverse", "viridis", "hillR","lme4", "lmer","sjPlot", "fossil", "lmerTest"))
+devtools::install_github('RRShieldsCutler/splinectomeR')
+```
+
+```{r load-libraries, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+library(knitr) #.rmd and table display functions
+library(tidyverse) #set of packages incl: dplyr, tidyr, readr, ggplot2
+library(reshape2) #melt and cast data
+library(viridis) #color palette for ggplot
+library(biomformat) #reads .biom tables
+library (phyloseq) #import, store, analyze, display OTU data
+library(DESeq2) #estimate variance-mean dependence in HTS
+library(vegan) #diversity, ordination, etc., for community ecology
+library(hillR) #calculate Hill numbers proposed by Chao, Chiu, &Jost
+library(lme4) #Fit linear and mixed effect models
+library(sjPlot) #collect outputs of models for data visualization
+library(splinectomeR) #compares longitudinal data between groups
+library(microbiome) #tools to manipulate, analyze, visualize microbiome data
+library (ALDEx2) #normalize and analyze sparse compositional data
+library(fossil) #calculates chao1 richness
+library(svglite)
+```
+
+## Import and clean data
+
+A phyloseq-class object requires an OTU or ASV table, a taxonomy table
+with matching OTU labels, and sample data with sample names matching
+those in the OTU table.
+
+From the final output of the q2 pipeline for this project, the
+taxa-table.biom already includes a merged taxa table. This and a mapping
+file (.txt) with sample data must be imported and merged.
+
+```{r biom-import}
+#import .biom file and parse taxa. "import_biom" creates a phyloseq-class object 
+phylo<- phyloseq::import_biom("C:/Users/maria/OneDrive/Documents/Dissertation/2 ITS Vitis/R analysis/taxa-table.biom", parseFunction=parse_taxonomy_default)
+
+#import mapping file. "row.names =1" required to ensure sample names which match otu table are used in import
+mapping <- read.delim("C:/Users/maria/OneDrive/Documents/Dissertation/2 ITS Vitis/R analysis/mapping.txt", row.names = 1)
+
+#define mapping file as sample data in phyloseq object
+phylo@sam_data<- sample_data(mapping)
+
+#rename tax table headers to reflect ranks. 
+colnames(tax_table(phylo)) <- c(k = "Kingdom", p = "Phylum", c = "Class", 
+    o = "Order", f = "Family", g = "Genus", s = "Species")
+
+#Clean prefixes from tax values in table
+tax_table(phylo)[, colnames(tax_table(phylo))] <- gsub(tax_table(phylo)[, colnames(tax_table(phylo))],     pattern = "[a-z]__", replacement = "")
+
+#Check that phyloseq-class object is loaded as expected.
+phylosumm<-summarize_phyloseq(phylo) 
+```
+
+### Subset for Vitis
+
+This analysis will focus on Vitis samples, both cultivated (VV) and wild
+(VR). !In the next iteration of code, we will subset again to exclude
+time points at which data are too sparse.
+
+```{r subset-prune}
+vit<- subset_samples(phylo, plantsp %in% c("VV","VR")) 
+
+#Remove samples with low sequence depths
+vit <- prune_samples(sample_sums(vit)>=1000, vit)
+  ##Samples removed: JU30/VV12_T4 at sample sum 53.
+
+#Remove time points with insufficient replicates
+vit<- prune_samples(sample_data(vit)$week %in% c("3", "4", "5","7","8"), vit)
+  #28 samples remain
+```
+
+### Create normalized data set
+
+It is not recommended these days that random rarefaction is used.
+Normalizing transformations are recommended instead (McMurdie & Holmes
+2014). For more on compositional data methods see Gloor et al. 2017
+(<https://www.frontiersin.org/articles/10.3389/fmicb.2017.02224/full>).
+
+```{r normalized-data}
+#normalize by clr using alde.clr, which first imputes zeros 
+vit_mat <- data.frame (otu_table(vit)) #convert to matrix for use by aldex
+vit_mat <- t(vit_mat) #transpose matrix
+vit_clr<- aldex.clr(vit_mat, mc.samples = 128, denom = ALL, verbose = FALSE)
+clr_reads<-getReads(vit_clr)
+
+#create data frames for further analyses
+otu_norm <- otu_table(t(clr_reads), taxa_are_rows = TRUE)
+tax_norm<- tax_table(vit)
+samp_norm<- sample_data(vit)
+vit_norm<- phyloseq(otu_norm)
+vit_norm<- merge_phyloseq(otu_norm, tax_norm, samp_norm)
+```
+
+### Generate rarefaction curves
+
+```{r rarefaction-curves}
+#produce vegan rarefaction curve for data
+out<- rarecurve(t(otu_table(vit)), step = 50)
+names(out) = colnames(otu_table(vit))
+
+#coerce data into long form
+protox <- mapply(FUN = function(x, y) {
+  mydf <- as.data.frame(x)
+  colnames(mydf) <- "value"
+  mydf$SampleID <- y
+  mydf$subsample <- attr(x, "Subsample")
+  mydf
+}, x = out, y = as.list(names(out)), SIMPLIFY = FALSE)
+xy <- do.call(rbind, protox)
+rownames(xy) <- NULL  # pretty
+xy = data.frame(xy, 
+  sample_data(vit)[match(xy$SampleID, rownames(sample_data(vit))), ])
+xy
+
+#Plot in ggplot
+ggplot(xy, aes(x = subsample, y = value, group=factor(SampleID), )) +
+  theme_bw() + 
+  scale_color_viridis(option= "mako", begin = 0.1, end = .65, discrete= TRUE)+
+  geom_line(aes(color=factor(plantsp))) +
+  labs(title="Rarefaction curves") + xlab("Sequenced Reads") + ylab('ASVs Detected')
+##export vegan and ggplot curves as svg to transfer labels
+```
+
+#####Results
+
+-   We observe a difference in ASVs detected between VR and VV
+
+## Alpha Diversity
+
+### Calculate Chao1, Shannon diversity, and inverse Simpson (Gini-Simpson)
+
+```{r alpha-indices, echo=TRUE}
+div<- data.frame (sample_data(vit))
+div$week <- as.numeric (div$week)
+div$shan<- hill_taxa(clr_reads, q=1)
+div$invSimp<- hill_taxa(clr_reads, q=2)
+```
+
+### Model alpha div
+
+Modelling is completed with the `splinectomeR` package, which provides a
+tool for comparing longitudinal compositional data between groups.
+`permuspliner` shows whether the groups are different over time, and can
+be plotted to showed each group (`…plot.permsplines`) or the difference
+between them (`…plot.permdistance`).
+
+#### Shannon diversity (evenness)
+
+```{r permuspline shannon, message=FALSE, warning=FALSE}
+shan_permures<-permuspliner(data = div, xvar= "week", yvar="shan", category = "plantsp", cases = "specimen", perms = 99, retain_perm = T, quiet = T)
+cat('p-value', shan_permures$pval)
+```
+
+```{r plotshan, echo=TRUE}
+plotshan <- permuspliner.plot.permsplines (data = shan_permures, xvar= "week", yvar="shan")+
+  ggtitle ("Actual and Permuted Splines for Gini-Simpson Index over Time")+
+  xlab("Week")+
+  ylab("Shannon Index")+
+  scale_colour_discrete(name = "Vitis species",
+  guide = guide_legend(override.aes = list(size = 5)))
+plotshan
+```
+
+```{r shandist}
+shandist<-permuspliner.plot.permdistance(shan_permures, xlabel= shan_permures$week)+
+  ggtitle ("Distance between Vitis Species Splines for Shannon Index over Time")+
+  xlab("Week")+
+  ylab("Shannon Index")
+shandist
+```
+
+```{r sig_weeks, eval=FALSE, include=FALSE}
+shan_slideresult <- sliding_spliner(data = div, xvar= "week", yvar='shan', category = 'plantsp', cases = 'specimen', quiet = F)
+```
+
+```{r shan trend-VV, message=FALSE, warning=FALSE}
+shan_trendVV<- trendyspliner(data = div, xvar = "week", cases = "specimen", mean_center = T, category = "plantsp", group="VV", yvar= "shan")
+cat(shan_trendVV$pval)
+```
+
+```{r shan trend-VR, message=FALSE, warning=FALSE}
+shan_trendVR<- trendyspliner(data = div, xvar = "week", cases = "specimen", mean_center = T, category = "plantsp", group="VR", yvar= "shan")
+cat(shan_trendVR$pval)
+```
+
+##### Results
+
+-   Shannon diversity differs between plant species. shan_permuresults
+    p-value=0.01
+
+-   VR diverges from VV, and from expected values more so than does VV.
+    shanplot
+
+-   Distances between two groups decreases over time, starting at
+    week 6. shandist
+
+-   The slopes of VV and VR are both not significant
+    shan_trendresultVX--VV p-value=0.887; VR p-value=0.477
+
+    \*\*Note, we saw SM dev at week 6, and 7, with steep drop off at
+    week 8 due to hard rain. Overlay prcp/week.
+
+#### Inverse Simpson (Gini-Simpson), Richness
+
+```{r overall differences GS, message=FALSE, warning=FALSE}
+GS_permures<-permuspliner(data = div, xvar= "week", yvar="invSimp", category = "plantsp", cases = "specimen", perms = 99, retain_perm = T, quiet = T)
+cat('p-value', GS_permures$pval)
+```
+
+```{r plotGS, echo=TRUE}
+plotGS <- permuspliner.plot.permsplines (data = GS_permures, xvar= "week", yvar="invSimp")+
+  ggtitle("Actual and Permuted Splines for Gini-Simpson Index over Time")+
+  xlab("Week")+
+  ylab("Gini-Simpson Index")+
+  scale_colour_discrete(name = "Vitis species",
+  guide = guide_legend(override.aes = list(size = 5)))
+plotGS  
+```
+
+```{r GSdist simp}
+GSdist<-permuspliner.plot.permdistance(GS_permures, xlabel= GS_permures$week)
+GSdist
+```
+
+```{r GS trend-VV, message=FALSE, warning=FALSE}
+GS_trendVV<- trendyspliner(data = div, xvar = "week", cases = "specimen", mean_center = T, category = "plantsp", group="VV", yvar= "invSimp")
+cat(GS_trendVV$pval)
+```
+
+```{r GS trend-VR, message=FALSE, warning=FALSE}
+GS_trendVR<- trendyspliner(data = div, xvar = "week", cases = "specimen", mean_center = T, category = "plantsp", group="VR", yvar= "invSimp")
+cat(GS_trendVR$pval)
+```
+
+#####Results - Overall difference between VR and VV in Richness (p-val
+0.01)
+
+-   Difference does not change over time based on plots
+
+-   Trends of VV and VR are insignificant, and based on plots, do not
+    trend
+
+###Summary Alpha Diversity
+
+-Vitis riparia is more rich and more even than Vitis vinifera at all
+time points. This trend tracks with rarefaction curves, where more ASVs
+were detected in VR, but all samples pass the elbow of the curve,
+indicating sequencing is sufficient to capture diversity. This observed
+difference may be the result of the effect of cultivation on
+phyllospheric community structure.
+
+-   We also observe an increase in Shannon diversity index between weeks
+    5&7. The property from which the samples were collected experienced
+    heavy rains in that time. Immediately after those rains, we observed
+    a noticeable increase in visible sooty mold, along with a decrease
+    in Shannon diversity, which prioritizes evenness. We hypothesize
+    that this means rainfall increased evenness by disrupting sooty mold
+    growth, but continued exposure to growing SLF permitted quick
+    regrowth of sooty mold afterwards.
+
+# Beta Div
+
+Use normalized data set
+
+<https://cran.r-project.org/web/packages/codyn/vignettes/Temporal_Diversity_Indices.html>
+<https://www.frontiersin.org/articles/10.3389/fmicb.2018.01037/full#h6>
+
+## Calculate Bray Curtis, plot NMDS
+
+```{r}
+#aggregate to species and remove unidentified OTU
+vittax<- aggregate_taxa(vit_norm, 'Species')
+vittax<- subset_taxa(vittax, Phylum != "unidentified")
+vittax<- subset_taxa(vittax, Phylum != "Unknown")
+vittax<- subset_taxa(vittax, Class != "unidentified" )
+
+#Calculate distance and ordination
+dist<- phyloseq::distance(vittax, method = "bray")
+ordination<- ordinate(vittax, method = "NMDS", distance = dist)
+```
+
+Stress 0.1364418--Good Procrustes: rmse 0.005194738 max resid 0.02069401
+
+```{r BC taxa plot, message=FALSE, warning=FALSE}
+#plot taxa ordination
+p1<-plot_ordination(vittax, ordination, type = "taxa", color = "Order")+
+  theme_light()+
+  theme(legend.key.size= unit(12, "points"), legend.position = "bottom" )+
+  ggtitle("Bray-Curtis of Order dissimilarities plotted by NMDS")
+P1<- p1+ facet_wrap (~Phylum)
+print(P1)
+ggsave(filename = "NMDS1key.eps", plot = P1, device = "eps", width = 12, height = 6, units = "in")
+```
+
+```{r BC sample plot, message=FALSE, warning=FALSE}
+p2<- plot_ordination(vittax, ordination, color = "week")+
+  theme_light()
+p2+ facet_wrap(~plantsp)
+```
+
+## PERMANOVA/Adonis from unpruned OTU data sets
+
+```{r permanova, echo=TRUE, fig.height=3}
+meta.data<- data.frame(samp_norm)
+dist_otu<-phyloseq::distance(vit_norm, method = "bray")
+test.adonis<- adonis(dist_otu ~ week*plantsp, data = meta.data, permutations = 999)
+test.adonis<- as.data.frame(test.adonis$aov.tab)
+knitr::kable (test.adonis, align= 'r', padding=3)
+```
+
+### Check homogeneity of variances
+
+```{r disper-week}
+dist
+disper<- betadisper(dist_otu, meta.data$plantsp)
+disptest<-permutest(disper)
+disper
+knitr::kable (disptest$tab, align= 'r', padding=3)
+```
+
+```{r disperplot}
+plot(disper, hull = FALSE, ellipse = TRUE)
+```
+
+##### Results
+
+-   Dispersals do not significantly vary between plant species
+    (p=0.346), so the effect of plant species that we see in the
+    PERMANOVA can be attributed to the difference in the centroids
+
+-   Dispersals not significantly vary between weeks (p=0.480) or
+    individual plants (p=0.486)
+
+# Relative Abundances
+
+## Plot mean abundances
+
+###Create data frames
+
+```{r prop abundance data frame}
+#create proportions
+prop<- transform_sample_counts(vittax, function(x) x/ sum(x) )
+
+#create data frames of phyloseq obj
+otudf<- data.frame(prop@otu_table)
+taxdf<- data.frame(prop@tax_table)
+metadf<- data.frame(prop@sam_data)
+
+#bind otu and tax frames (same # rows)
+propmelt<- cbind(otudf, taxdf[rownames(otudf), ])
+propdf<- melt(propmelt)
+
+#merge
+metadf$variable<- colnames(otudf)
+propdf<- merge(propdf, metadf, by= "variable")
+```
+
+####Prep color palette
+
+```{r save funtion to create color palette}
+ColourPalleteMulti <- function(df, group, subgroup){
+
+  # Find how many colour categories to create and the number of colours in each
+  categories <- aggregate(as.formula(paste(subgroup, group, sep="~" )), df, function(x) length(unique(x)))
+  category.start <- (scales::hue_pal(l = 100)(nrow(categories))) # Set the top of the colour pallete
+  category.end  <- (scales::hue_pal(l = 40)(nrow(categories))) # set the bottom
+
+  # Build Colour pallette
+  colours <- unlist(lapply(1:nrow(categories),
+                          function(i){
+                            colorRampPalette(colors = c(category.start[i], category.end[i]))(categories[i,2])}))
+  return(colours)
+}
+```
+
+###Create and print plot to svg
+
+```{r plot stackbar}
+colors<- ColourPalleteMulti(propdf, "Order", "Genus")
+rel.abundplot<-ggplot(data=propdf, aes(x=factor(week), y=value))+ 
+  geom_bar(aes(fill=factor(Genus)), position="fill", stat= "identity")+
+  theme_classic()+
+  theme(panel.background = element_rect(fill = "transparent", colour = NA),  
+        plot.background = element_rect(fill = "transparent", colour = NA), 
+        legend.position  = "bottom")+
+  scale_fill_manual("", values = colors)+   
+  ggtitle("Abundance Proportions by Genus")+
+  xlab("Week")+
+  ylab("Abundance Proportion")
+ggsave("relabund", plot = rel.abundplot, device = "svg", path = "C:/Users/maria/OneDrive/Documents/Dissertation/2 ITS Vitis/R analysis/")
+rel.abundplot+
+  theme(legend.position = "none")
+```
+
+## Differential Abundance testing
+
+Use non-normalized dataset, aggregated to species, with
+unknown/unassigned removed ###Significant genera by
+
+```{r DeSeq}
+#aggregate to species and remove unidentified OTU
+tax<- aggregate_taxa(vit, 'Genus')
+tax<- subset_taxa(tax, Phylum != "unidentified")
+tax<- subset_taxa(tax, Phylum != "Unknown")
+tax<- subset_taxa(tax, Class != "unidentified" )
+tax<- subset_taxa(tax, Genus != "unidentified" )
+```
+
+```{r DeSeq plant species}
+#create DESeq2 data set
+vitsp<- ~plantsp
+dsobjsp<- phyloseq_to_deseq2(tax, design= vitsp)
+
+#run DESeq2
+dssp<- DESeq(dsobjsp)
+
+#print results, filtering w/alpha
+alpha= 0.01
+ressp<- results(dssp, contrast= c("plantsp", "VR", "VV"), alpha= alpha)
+ressp<- ressp[order(ressp$padj, na.last=NA), ]
+ressp_sig <- ressp[(ressp$padj < alpha), ]
+knitr::kable (ressp_sig[ ,1:6], digits=5, padding = 5)
+```
+
+```{r plot DeSeq plant species}
+ressp_sig <- cbind(as(ressp_sig, "data.frame"), as(tax_table(tax)[rownames(ressp_sig), ], "matrix"))
+
+ggplot(ressp_sig, aes(x= Genus, y=log2FoldChange, color= Order)) +
+  geom_jitter(size=3, width = 0.2) +
+  ggtitle("log2 fold change from Vitis riparia to Vitis vinifera (MLE)", 
+      subtitle = "Genera with p-val <0.01. VR =0")+
+  theme_light()+
+    theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0))
+```
+
+###Plot sig genera
+
+```{r}
+#Define vector of sig genera
+gen<-row.names(ressp_sig)
+#Filter df
+siggendf<- filter(propdf, Genus== gen)
+siggendf$week<-as.numeric(siggendf$week)
+siggenplot<-ggplot(data=siggendf, aes(week , value))+
+  geom_line(aes(color = Genus), size=1, stat= "summary", fun = mean)+
+  geom_point(aes(color = Genus), size= 2, stat= "summary", fun = mean)+
+  theme_classic()+
+  theme(panel.background = element_rect(fill = "transparent", colour = NA),  
+        plot.background = element_rect(fill = "transparent", colour = NA))+
+  ggtitle("Mean abundance significant genera by week")
+siggenplot+ 
+  facet_wrap(~plantsp)
+```
+
+#####Results Trichomerium is the only significant genus which is also
+abundant. At week 7, when we saw the most sooty mold, we also see a peak
+in Trichomerium in Vitis riparia, but not in Vitis vinifera. Sooty mold
+in Ailanthus appeared to be correlated with Trichomerium. It is possible
+that cultivation has changed the sooty mold that is successful when
+exposed to SLF.
